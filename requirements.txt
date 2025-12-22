@@ -1,0 +1,23 @@
+# SCADA Collector + TC2 Processor Dependencies
+# Установка: pip install -r requirements.txt
+
+# Веб-фреймворк
+Flask>=2.3.0
+flask-caching>=2.1.0
+
+# База данных
+pyodbc>=4.0.39      # Синхронные MSSQL (Flask)
+aioodbc>=0.4.0      # Асинхронные MSSQL (Collector)
+fdb>=2.0.2          # Firebird
+SQLAlchemy>=2.0.23  # Connection pooling
+
+# HTTP запросы
+aiohttp>=3.9.0      # Асинхронные HTTP (Telegram)
+
+# Обработка данных (TC2)
+pandas>=2.0.0       # Excel обработка
+openpyxl>=3.1.0     # Excel формат .xlsx
+
+# Опционально для production
+waitress>=2.1.2     # WSGI сервер
+

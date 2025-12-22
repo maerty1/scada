@@ -1,0 +1,87 @@
+{
+    "database": {
+        "server": "localhost",
+        "database": "YourDatabaseName",
+        "username": "your_db_user",
+        "password": "your_db_password"
+    },
+    "telegram": {
+        "chat_id": "-1000000000000",
+        "bot_token": "1234567890:ABCdefGHIjklMNOpqrsTUVwxyz",
+        "rate_limit_messages": 5,
+        "rate_limit_window": 60,
+        "rate_limit_cooldown": 300
+    },
+    "web": {
+        "host": "0.0.0.0",
+        "port": 80
+    },
+    "sync_interval": 5,
+    "notification_timeout": 7200,
+    "sync_mssql": [
+        {
+            "source_server": "192.168.1.100",
+            "source_db": "SourceDB",
+            "source_table": "TS_1M1",
+            "source_user": "source_user",
+            "source_pass": "source_password",
+            "target_table": "Dynamic_1_M1"
+        }
+    ],
+    "sync_firebird": [
+        {
+            "host": "192.168.1.200",
+            "port": 3050,
+            "database": "C:\\Path\\To\\Database\\DATABASE.FDB",
+            "table": "DYN_DATA",
+            "user": "SYSDBA",
+            "password": "masterkey",
+            "target_table": "dbo.Dynamic_2",
+            "objid": 1
+        }
+    ],
+    "table_names": {
+        "Dynamic_1_M1": "TIM ТЦ-1, M-1",
+        "Dynamic_1_M4": "TIM ТЦ-1, M-4",
+        "Dynamic": "TIM ТЦ-2",
+        "Dynamic_San": "ВЕТ Саноатэнерго",
+        "Dynamic_2": "ВЕТ Водник",
+        "Dynamic_3_M1": "TIM ТЦ-3, M-1",
+        "Dynamic_3_M4": "TIM ТЦ-3, M-4",
+        "Dynamic_4_M0": "TIM ТЦ-4, M-0",
+        "Dynamic_4_M1": "TIM ТЦ-4, M-1",
+        "Dynamic_4_M4": "TIM ТЦ-4, M-4",
+        "Dynamic_4_M8": "TIM ТЦ-4, M-8",
+        "Dynamic_5_M0": "TIM ТЦ-5, M-0",
+        "Dynamic_5_M4": "TIM ТЦ-5, M-4",
+        "Dynamic_6": "TIM ТЦ-6, M-0",
+        "Dynamic_7_M1": "TIM ТЦ-7, M-1",
+        "Dynamic_7_M2": "TIM ТЦ-7, M-2",
+        "Dynamic_8": "TIM ТЦ-8, M-0",
+        "Dynamic_9": "TIM ТЦ-9, M-0",
+        "Dynamic_10": "TIM ТЦ-10, M-0",
+        "Dynamic_TC2": "ВЕТ ТЦ-2",
+        "Dynamic_TETs_1": "TIEM ТЭЦ-1 Чилонзор",
+        "Dynamic_TETs_2": "TIEM ТЭЦ-2 Аэропорт",
+        "Dynamic_TETs_3": "TIEM ТЭЦ-3 Марказ"
+    },
+    "tc2_processor": {
+        "enabled": true,
+        "files_directory": "\\\\192.168.1.100\\share\\path\\to\\files",
+        "monitor_interval": 30,
+        "days_to_search": 30,
+        "skip_footer_rows": 1,
+        "target_table": "dbo.Dynamic_TC2",
+        "object_id": 1,
+        "id_value": 1,
+        "objid_value": 1,
+        "network_check_interval": 3600,
+        "initial_network_wait": 30,
+        "file_check_interval": 3600
+    },
+    "service": {
+        "run_as_user": "domain\\username",
+        "run_as_password": "your_service_password"
+    }
+}
+
