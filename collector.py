@@ -9,7 +9,6 @@ import sys
 import gzip
 import os
 import re
-import subprocess
 from datetime import datetime, timedelta
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -1749,82 +1748,40 @@ async def run_sync_firebird_async(sync_config, telegram_session):
 # =============================================================================
 # TC2 HEATING PROCESSOR (ASYNC)
 # =============================================================================
-def _connect_to_network_share(share_path, username, password):
-    r"""
-    Подключение к сетевой папке с использованием учетных данных через net use
-    
-    Args:
-        share_path: UNC путь к сетевой папке (например, \\192.168.1.1\share)
-        username: Имя пользователя (например, domain\user или user@domain.com)
-        password: Пароль
-    
-    Returns:
-        bool: True если подключение успешно, False в противном случае
-    """
-    try:
-        # Извлекаем базовый путь к шаре (первые два уровня UNC пути)
-        # Например: \\192.168.230.241\c$ из \\192.168.230.241\c$\hscmt\Ozbekiston\cal\H
-        parts = share_path.replace('\\', '/').strip('/').split('/')
-        if len(parts) >= 2:
-            base_share = f"\\\\{parts[0]}\\{parts[1]}"
-        else:
-            base_share = share_path
-        
-        # Формируем команду net use
-        # Используем /persistent:no чтобы не сохранять подключение после перезагрузки
-        # Для доменного пользователя в формате user@domain.com используем его как есть
-        # Для формата domain\user также используем как есть
-        cmd = [
-            'net', 'use', base_share,
-            f'/user:{username}',
-            password,
-            '/persistent:no'
-        ]
-        
-        # Выполняем команду (скрываем вывод пароля)
-        # Используем shell=True для правильной обработки специальных символов в пароле
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            shell=False,  # False для безопасности, но может потребоваться shell=True для некоторых символов
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-        )
-        
-        if result.returncode == 0:
-            logging.info(f"TC2: Успешное подключение к сетевой папке: {base_share}")
-            return True
-        else:
-            # Проверяем, может быть папка уже подключена
-            error_text = result.stderr.lower() if result.stderr else ''
-            if 'already connected' in error_text or 'уже подключен' in error_text:
-                logging.info(f"TC2: Сетевая папка уже подключена: {base_share}")
-                return True
-            else:
-                logging.warning(f"TC2: Ошибка подключения к сетевой папке {base_share}: {result.stderr}")
-                return False
-                
-    except subprocess.TimeoutExpired:
-        logging.error(f"TC2: Таймаут при подключении к сетевой папке: {share_path}")
-        return False
-    except Exception as e:
-        logging.error(f"TC2: Исключение при подключении к сетевой папке: {e}", exc_info=True)
-        return False
-
-
 def _read_excel_file_sync(file_path, skip_footer_rows, last_db_record):
     """Синхронная функция чтения Excel файла"""
     try:
         if not file_path.exists():
             return None
 
-        # Создаем временную копию файла
+        # Создаем временную копию файла для чтения без блокировки оригинала
+        # Используем tempfile для создания уникального временного файла
         with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as temp_file:
             temp_path = temp_file.name
 
         try:
-            shutil.copy2(file_path, temp_path)
+            # Копируем файл с повторными попытками на случай временной блокировки
+            # Используем copy вместо copy2 для более быстрого копирования (без метаданных)
+            max_retries = 3
+            retry_delay = 0.1  # 100ms между попытками
+            
+            for attempt in range(max_retries):
+                try:
+                    # Пытаемся скопировать файл
+                    # Используем copyfile для более быстрого копирования
+                    shutil.copyfile(str(file_path), temp_path)
+                    break  # Успешно скопировано
+                except (PermissionError, OSError) as e:
+                    if attempt < max_retries - 1:
+                        # Файл может быть временно заблокирован другим процессом
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Увеличиваем задержку
+                        logging.debug(f"TC2: Попытка {attempt + 1}/{max_retries} копирования файла {file_path.name} (файл может быть заблокирован)")
+                    else:
+                        # Все попытки исчерпаны
+                        raise
+            
+            # Читаем из временной копии - оригинальный файл больше не блокируется
             df = pd.read_excel(temp_path, skipfooter=skip_footer_rows)
 
             if df.empty:
@@ -1905,6 +1862,7 @@ def _read_excel_file_sync(file_path, skip_footer_rows, last_db_record):
                 initial_rows = len(df)
                 last_db_dt = pd.to_datetime(last_db_record)
                 # Используем строгое сравнение > для фильтрации
+                # Записи с тем же временем считаются уже обработанными
                 df = df[df['check_datetime'] > last_db_dt]
                 filtered_rows = initial_rows - len(df)
                 if filtered_rows > 0:
@@ -1937,20 +1895,42 @@ def _read_excel_file_sync(file_path, skip_footer_rows, last_db_record):
         return None
 
 
-async def read_excel_file_async(file_path, skip_footer_rows, last_db_record):
-    """Асинхронная обертка для чтения Excel"""
+async def read_excel_file_async(file_path, skip_footer_rows, last_db_record=None, read_all=False):
+    """Асинхронная обертка для чтения Excel
+    
+    Args:
+        file_path: Путь к файлу
+        skip_footer_rows: Количество строк в конце файла для пропуска
+        last_db_record: Последняя запись в БД (для фильтрации, если read_all=False)
+        read_all: Если True, читает все данные без фильтрации по last_db_record
+    """
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        sync_executor,
-        _read_excel_file_sync,
-        file_path, skip_footer_rows, last_db_record
-    )
+    if read_all:
+        # Читаем все данные без фильтрации
+        return await loop.run_in_executor(
+            sync_executor,
+            _read_excel_file_sync,
+            file_path, skip_footer_rows, None  # Передаем None вместо last_db_record
+        )
+    else:
+        return await loop.run_in_executor(
+            sync_executor,
+            _read_excel_file_sync,
+            file_path, skip_footer_rows, last_db_record
+        )
 
 
 
 
-async def save_tc2_to_sqlserver_async(cursor, conn, df, config):
-    """Асинхронная вставка данных TC2 в SQL Server
+async def save_tc2_to_sqlserver_async(cursor, conn, df, config, check_existing=True):
+    """Асинхронная вставка данных TC2 в SQL Server с проверкой существующих записей
+    
+    Args:
+        cursor: Курсор БД
+        conn: Соединение с БД
+        df: DataFrame с данными
+        config: Конфигурация
+        check_existing: Если True, проверяет существование записей перед вставкой
     
     Returns:
         tuple: (количество вставленных строк, максимальное время RECTIME вставленных записей)
@@ -2005,6 +1985,48 @@ async def save_tc2_to_sqlserver_async(cursor, conn, df, config):
         if not rows:
             return 0, None
 
+        # Если включена проверка существующих записей, фильтруем их
+        if check_existing and len(rows) > 0:
+            # Получаем список существующих записей из БД
+            # Используем уникальный ключ: ObjectId, ID, OBJID, RECTIME
+            existing_records = set()
+            
+            # Получаем диапазон дат из данных
+            rectimes = [row[3] for row in rows]  # RECTIME на позиции 3
+            min_rectime = min(rectimes)
+            max_rectime_check = max(rectimes)
+            
+            try:
+                check_sql = f"""
+                SELECT RECTIME 
+                FROM {config['target_table']}
+                WHERE ObjectId = ? AND ID = ? AND OBJID = ? 
+                AND RECTIME >= ? AND RECTIME <= ?
+                """
+                await cursor.execute(check_sql, (obj, idv, ojd, min_rectime, max_rectime_check))
+                existing_results = await cursor.fetchall()
+                existing_records = {row[0] for row in existing_results}
+                logging.debug(f"TC2: Найдено {len(existing_records)} существующих записей в БД за период {min_rectime} - {max_rectime_check}")
+            except Exception as e:
+                logging.warning(f"TC2: Ошибка при проверке существующих записей: {e}. Будет использована обработка дубликатов.")
+                existing_records = set()
+            
+            # Фильтруем строки, которые уже есть в БД
+            filtered_rows = []
+            for row in rows:
+                rectime = row[3]
+                if rectime not in existing_records:
+                    filtered_rows.append(row)
+            
+            if len(filtered_rows) < len(rows):
+                logging.info(f"TC2: Отфильтровано {len(rows) - len(filtered_rows)} существующих записей из {len(rows)}. Осталось {len(filtered_rows)} новых.")
+            
+            rows = filtered_rows
+
+        if not rows:
+            logging.debug(f"TC2: Все записи уже существуют в БД")
+            return 0, None
+
         sql = f"""
         INSERT INTO {config['target_table']}
         (ObjectId, ID, OBJID, RECTIME, T1, T2, T3, T4, T5, T6, V1, V2, P1, P2, T7, T8, V3, V4, V5, P3, P4, H1, H2, H3, H4)
@@ -2018,7 +2040,7 @@ async def save_tc2_to_sqlserver_async(cursor, conn, df, config):
             logging.info(f"TC2: Вставлено {inserted} строк в {config['target_table']}, максимальное время: {max_rectime}")
             return inserted, max_rectime
         except Exception as e:
-            if 'IntegrityError' in str(type(e)) or 'duplicate' in str(e).lower():
+            if 'IntegrityError' in str(type(e)) or 'duplicate' in str(e).lower() or 'unique' in str(e).lower():
                 await conn.rollback()
                 success_count = 0
                 success_max_rectime = None
@@ -2074,12 +2096,7 @@ async def run_tc2_processor_async(config, telegram_session):
 
     logging.info(f"TC2 процессор инициализирован. Каталог: {files_directory}")
     logging.info(f"TC2: Интервал проверки файлов: {file_check_interval/60:.0f} минут")
-    
-    # Получаем учетные данные для сетевой папки из конфигурации
-    service_config = CONFIG.get('service', {})
-    network_username = service_config.get('run_as_user', '')
-    network_password = service_config.get('run_as_password', '')
-    network_connected = False  # Флаг подключения к сетевой папке
+    logging.info(f"TC2: Авторизация в сетевую папку выполняется через учетную запись службы Windows")
 
     while not shutdown_event.is_set():
         try:
@@ -2103,21 +2120,7 @@ async def run_tc2_processor_async(config, telegram_session):
             if not network_available or network_check_counter >= check_interval:
                 network_check_counter = 0
                 try:
-                    # Подключение к сетевой папке с учетными данными из config.json
-                    if str(files_directory).startswith('\\\\'):
-                        # Если папка недоступна и есть учетные данные, пытаемся подключиться
-                        if not network_connected or not files_directory.exists():
-                            if network_username and network_password:
-                                logging.info(f"TC2: Попытка подключения к сетевой папке с учетными данными: {network_username}")
-                                network_connected = _connect_to_network_share(
-                                    str(files_directory),
-                                    network_username,
-                                    network_password
-                                )
-                            else:
-                                logging.warning("TC2: Учетные данные для сетевой папки не найдены в config.json (секция service)")
-                    
-                    # Проверяем доступность папки
+                    # Проверяем доступность папки (авторизация через учетную запись службы)
                     if files_directory.exists():
                         try:
                             list(files_directory.glob("*"))
@@ -2132,14 +2135,7 @@ async def run_tc2_processor_async(config, telegram_session):
                 except PermissionError as e:
                     network_available = False
                     logging.error(f"TC2: Ошибка доступа к сетевой папке (нет прав): {e}")
-                    # Пытаемся переподключиться
-                    if network_username and network_password:
-                        logging.info("TC2: Попытка переподключения к сетевой папке...")
-                        network_connected = _connect_to_network_share(
-                            str(files_directory),
-                            network_username,
-                            network_password
-                        )
+                    logging.error(f"TC2: Убедитесь, что служба запущена от имени пользователя с правами доступа к папке")
                 except Exception as e:
                     network_available = False
                     logging.debug(f"TC2: Директория недоступна: {e}")
@@ -2205,8 +2201,8 @@ async def run_tc2_processor_async(config, telegram_session):
                                     # Прошло достаточно времени с последней проверки
                                     should_process = True
                                     logging.debug(f"TC2: Файл текущего дня {file_path.name} будет обработан (прошло {time_since_last_check/60:.0f} мин. с последней проверки)")
-                                elif file_updated_after_db and time_since_last_check >= 300:  # Минимум 5 минут между проверками
-                                    # Файл обновлен после БД, но прошло минимум 5 минут с последней проверки
+                                elif file_updated_after_db and time_since_last_check >= 60:  # Минимум 1 минута между проверками
+                                    # Файл обновлен после БД, но прошло минимум 1 минута с последней проверки
                                     should_process = True
                                     logging.debug(f"TC2: Файл текущего дня {file_path.name} будет обработан (обновлен после БД, прошло {time_since_last_check/60:.0f} мин.)")
                                 else:
@@ -2218,9 +2214,20 @@ async def run_tc2_processor_async(config, telegram_session):
                                 # Файлы с датой новее последней записи в БД
                                 should_process = True
                             elif file_date == last_db_date:
-                                # Файлы с той же датой - проверяем время модификации
-                                # Если файл был изменен недавно (в последние 2 часа), обрабатываем
-                                if time_since_modification < 2:
+                                # Файлы с той же датой - всегда обрабатываем, если файл был изменен после последней записи в БД
+                                # или если прошло достаточно времени с последней проверки
+                                file_updated_after_db = not last_db_record or file_mtime > last_db_record
+                                last_check = files_last_check.get(file_path.name)
+                                time_since_last_check = (current_time - last_check).total_seconds() if last_check else float('inf')
+                                
+                                if file_updated_after_db:
+                                    should_process = True
+                                    logging.debug(f"TC2: Файл {file_path.name} с датой {file_date} будет обработан (изменен после БД: {file_mtime} > {last_db_record})")
+                                elif last_check and time_since_last_check >= file_check_interval:
+                                    should_process = True
+                                    logging.debug(f"TC2: Файл {file_path.name} с датой {file_date} будет обработан (прошло {time_since_last_check/60:.0f} мин. с последней проверки)")
+                                elif time_since_modification < 2:
+                                    # Если файл был изменен недавно (в последние 2 часа), обрабатываем
                                     should_process = True
                                     logging.debug(f"TC2: Файл {file_path.name} с датой {file_date} будет обработан (изменен {time_since_modification:.1f} ч. назад)")
                             
@@ -2280,7 +2287,9 @@ async def run_tc2_processor_async(config, telegram_session):
                     
                     logging.info(f"TC2: Обработка {file_path.name} (изменен: {file_mtime.strftime('%Y-%m-%d %H:%M:%S')}, размер: {file_size:.1f} KB, последняя запись в БД: {last_db_record}, файл обновлен после БД: {file_updated_after_db})")
                     
-                    df = await read_excel_file_async(file_path, skip_footer_rows, last_db_record)
+                    # Читаем ВСЕ данные из файла без фильтрации по last_db_record
+                    # Проверка существующих записей будет выполнена в save_tc2_to_sqlserver_async
+                    df = await read_excel_file_async(file_path, skip_footer_rows, last_db_record=None, read_all=True)
 
                     if df is not None and not df.empty:
                         # Получаем информацию о данных в файле
@@ -2300,7 +2309,8 @@ async def run_tc2_processor_async(config, telegram_session):
                                 file_max_time = df_with_dates[date_col].max().to_pydatetime()
                                 logging.debug(f"TC2: {file_path.name} - данные в файле: {file_min_time} - {file_max_time}")
                         
-                        inserted, max_inserted_time = await save_tc2_to_sqlserver_async(mssql_cursor, mssql_conn, df, config)
+                        # Сохраняем данные с проверкой существующих записей
+                        inserted, max_inserted_time = await save_tc2_to_sqlserver_async(mssql_cursor, mssql_conn, df, config, check_existing=True)
                         if inserted > 0:
                             processed_count += inserted
                             # Обновляем максимальное время обработанных записей
