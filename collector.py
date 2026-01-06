@@ -1559,6 +1559,7 @@ async def check_and_notify_async(table_name, last_update_time, telegram_session=
     """Асинхронная проверка и отправка уведомления если данные устарели"""
     notification_timeout = CONFIG.get('notification_timeout', 7200)
     
+    # Используем блокировку для предотвращения race conditions
     lock_ctx = notifications_lock if notifications_lock else asyncio.Lock() if hasattr(asyncio, 'Lock') else None
     if lock_ctx:
         async with lock_ctx:
@@ -1568,18 +1569,92 @@ async def check_and_notify_async(table_name, last_update_time, telegram_session=
 
 
 async def _check_and_notify_logic(table_name, last_update_time, notification_timeout, telegram_session):
-    """Логика проверки уведомлений"""
-    if last_update_time:
+    """Логика проверки уведомлений
+    
+    Структура sent_notifications:
+    {
+        table_name: (was_notified: bool, last_known_update_time: datetime, last_notification_time: datetime)
+    }
+    
+    Уведомление отправляется только если:
+    1. Данные устарели (более notification_timeout секунд)
+    2. И либо уведомление еще не отправлялось, либо данные обновились после последнего уведомления
+    """
+    if not last_update_time:
+        return
+    
+    now = datetime.now()
+    time_since_update = (now - last_update_time).total_seconds()
+    is_outdated = time_since_update > notification_timeout
+    
+    if not is_outdated:
+        # Данные актуальны - сбрасываем флаг уведомления, если данные обновились
         if table_name in sent_notifications:
-            if sent_notifications[table_name][1] < last_update_time:
-                sent_notifications[table_name] = (False, last_update_time)
+            was_notified, last_known_time, _ = sent_notifications[table_name]
+            # Нормализуем для сравнения
+            last_update_norm = last_update_time.replace(microsecond=0) if isinstance(last_update_time, datetime) else last_update_time
+            last_known_norm = last_known_time.replace(microsecond=0) if isinstance(last_known_time, datetime) and last_known_time else None
+            
+            if last_known_norm and isinstance(last_update_norm, datetime) and isinstance(last_known_norm, datetime):
+                if last_update_norm > last_known_norm:
+                    # Данные обновились - сбрасываем флаг уведомления
+                    sent_notifications[table_name] = (False, last_update_time, None)
+            elif last_known_norm is None or last_update_norm != last_known_norm:
+                # Первый раз или данные изменились - сбрасываем
+                sent_notifications[table_name] = (False, last_update_time, None)
         else:
-            sent_notifications[table_name] = (False, last_update_time)
-
-        if (datetime.now() - last_update_time).total_seconds() > notification_timeout and not sent_notifications[table_name][0]:
-            message = f"Данные в таблице {table_name} не обновлялись более {notification_timeout // 3600} часов.\nhttp://scada.veoliaenergy.uz/"
-            await send_telegram_message(message, session=telegram_session)
-            sent_notifications[table_name] = (True, last_update_time)
+            # Первая проверка - инициализируем
+            sent_notifications[table_name] = (False, last_update_time, None)
+        return
+    
+    # Данные устарели - проверяем, нужно ли отправлять уведомление
+    if table_name not in sent_notifications:
+        # Первая проверка устаревших данных - отправляем уведомление
+        message = f"Данные в таблице {table_name} не обновлялись более {notification_timeout // 3600} часов.\nhttp://scada.veoliaenergy.uz/"
+        await send_telegram_message(message, session=telegram_session)
+        sent_notifications[table_name] = (True, last_update_time, now)
+        logging.info(f"Уведомление отправлено: {table_name} (последнее обновление: {last_update_time})")
+        return
+    
+    # Таблица уже в словаре - проверяем состояние
+    was_notified, last_known_time, last_notification_time = sent_notifications[table_name]
+    
+    # Нормализуем datetime для корректного сравнения (убираем микросекунды)
+    last_update_normalized = last_update_time.replace(microsecond=0) if isinstance(last_update_time, datetime) else last_update_time
+    last_known_normalized = last_known_time.replace(microsecond=0) if isinstance(last_known_time, datetime) and last_known_time else None
+    
+    # Проверяем, стали ли данные актуальными (не устарели)
+    # Если данные стали актуальными (не устарели), сбрасываем флаг уведомления
+    time_since_last_update = (now - last_update_normalized).total_seconds() if isinstance(last_update_normalized, datetime) else notification_timeout + 1
+    is_now_actual = time_since_last_update <= notification_timeout
+    
+    # Логика отправки уведомления:
+    # 1. Если данные стали актуальными - сбрасываем флаг уведомления (не отправляем)
+    # 2. Если данные устарели И уведомление еще не отправлялось - отправляем
+    # 3. Если уведомление уже отправлено И данные все еще устарели - НЕ отправляем повторно
+    
+    if is_now_actual:
+        # Данные стали актуальными - сбрасываем флаг уведомления
+        sent_notifications[table_name] = (False, last_update_time, None)
+        logging.debug(f"Данные в таблице {table_name} стали актуальными, флаг уведомления сброшен")
+        return
+    
+    # Данные все еще устарели
+    # Проверяем, действительно ли уведомление уже было отправлено
+    # Это критически важно для предотвращения спама
+    if was_notified:
+        # Уведомление уже было отправлено - НЕ отправляем повторно
+        # Это основная защита от спама: если уведомление уже отправлено, не отправляем снова
+        # Даже если данные немного изменились, но все еще устарели - не отправляем повторно
+        logging.debug(f"Уведомление для {table_name} уже отправлено, пропускаем (последнее обновление: {last_update_time}, уведомление было: {last_notification_time}, было отправлено: {was_notified})")
+        # НЕ обновляем запись и НЕ отправляем уведомление
+        return
+    
+    # Уведомление еще не отправлялось - отправляем
+    message = f"Данные в таблице {table_name} не обновлялись более {notification_timeout // 3600} часов.\nhttp://scada.veoliaenergy.uz/"
+    await send_telegram_message(message, session=telegram_session)
+    sent_notifications[table_name] = (True, last_update_time, now)
+    logging.info(f"Уведомление отправлено: {table_name} (последнее обновление: {last_update_time}, was_notified было: {was_notified})")
 
 
 async def run_sync_mssql_async(sync_config, telegram_session):
@@ -2005,17 +2080,51 @@ async def save_tc2_to_sqlserver_async(cursor, conn, df, config, check_existing=T
                 """
                 await cursor.execute(check_sql, (obj, idv, ojd, min_rectime, max_rectime_check))
                 existing_results = await cursor.fetchall()
-                existing_records = {row[0] for row in existing_results}
+                
+                # Безопасная обработка результатов
+                existing_records = set()
+                if existing_results:
+                    for row in existing_results:
+                        if row and len(row) > 0 and row[0] is not None:
+                            # Преобразуем datetime в datetime для корректного сравнения
+                            rectime_from_db = row[0]
+                            if isinstance(rectime_from_db, datetime):
+                                existing_records.add(rectime_from_db)
+                            elif hasattr(rectime_from_db, 'to_pydatetime'):
+                                existing_records.add(rectime_from_db.to_pydatetime())
+                            else:
+                                # Пытаемся преобразовать в datetime
+                                try:
+                                    existing_records.add(pd.to_datetime(rectime_from_db).to_pydatetime())
+                                except:
+                                    pass
                 logging.debug(f"TC2: Найдено {len(existing_records)} существующих записей в БД за период {min_rectime} - {max_rectime_check}")
             except Exception as e:
-                logging.warning(f"TC2: Ошибка при проверке существующих записей: {e}. Будет использована обработка дубликатов.")
+                logging.error(f"TC2: Ошибка при проверке существующих записей: {e}", exc_info=True)
                 existing_records = set()
             
             # Фильтруем строки, которые уже есть в БД
             filtered_rows = []
             for row in rows:
-                rectime = row[3]
-                if rectime not in existing_records:
+                try:
+                    rectime = row[3]
+                    # Преобразуем rectime в datetime для корректного сравнения
+                    if isinstance(rectime, datetime):
+                        rectime_dt = rectime
+                    elif hasattr(rectime, 'to_pydatetime'):
+                        rectime_dt = rectime.to_pydatetime()
+                    else:
+                        rectime_dt = pd.to_datetime(rectime).to_pydatetime()
+                    
+                    # Сравниваем с точностью до секунды для избежания проблем с микросекундами
+                    rectime_normalized = rectime_dt.replace(microsecond=0)
+                    existing_normalized = {dt.replace(microsecond=0) if isinstance(dt, datetime) else dt for dt in existing_records}
+                    
+                    if rectime_normalized not in existing_normalized:
+                        filtered_rows.append(row)
+                except Exception as e:
+                    # Если ошибка при сравнении, добавляем строку (лучше добавить, чем потерять)
+                    logging.warning(f"TC2: Ошибка при сравнении RECTIME {row[3]}: {e}. Запись будет добавлена.")
                     filtered_rows.append(row)
             
             if len(filtered_rows) < len(rows):
