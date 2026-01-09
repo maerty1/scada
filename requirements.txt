@@ -21,3 +21,6 @@ openpyxl>=3.1.0     # Excel формат .xlsx
 # Опционально для production
 waitress>=2.1.2     # WSGI сервер
 
+# Генерация PDF схем
+reportlab>=4.0.0    # Генерация PDF документов
+
